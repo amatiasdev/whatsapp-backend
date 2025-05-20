@@ -69,7 +69,7 @@ const sessionSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: false
+    required: true  // Cambiado de false a true
   }
 }, {
   timestamps: true,
@@ -82,6 +82,9 @@ sessionSchema.index({ sessionId: 1 });
 sessionSchema.index({ userId: 1 });
 sessionSchema.index({ status: 1 });
 sessionSchema.index({ createdAt: -1 });
+
+// Índice compuesto para búsquedas comunes (usuario + estado)
+sessionSchema.index({ userId: 1, status: 1 });
 
 const Session = mongoose.model('Session', sessionSchema);
 

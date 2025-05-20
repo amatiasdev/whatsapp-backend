@@ -1,4 +1,3 @@
-
 /**
  * @swagger
  * components:
@@ -27,6 +26,9 @@
  *           type: string
  *           enum: [initializing, qr_ready, connected, disconnected, failed]
  *           description: Estado actual de la sesión
+ *         userId:
+ *           type: string
+ *           description: ID del usuario propietario de la sesión
  *     
  *     Error:
  *       type: object
@@ -38,9 +40,53 @@
  *           type: string
  *           description: Mensaje de error
  *
+ * /sessions/user-session:
+ *   post:
+ *     summary: Obtiene o crea una sesión para el usuario actual
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Sesión existente reutilizada
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   $ref: '#/components/schemas/Session'
+ *                 isExisting:
+ *                   type: boolean
+ *                   example: true
+ *       201:
+ *         description: Nueva sesión creada
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                   example: true
+ *                 data:
+ *                   $ref: '#/components/schemas/Session'
+ *                 isExisting:
+ *                   type: boolean
+ *                   example: false
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado
+ *       500:
+ *         description: Error del servidor
+ *
  * /sessions:
  *   get:
- *     summary: Obtiene todas las sesiones
+ *     summary: Obtiene todas las sesiones del usuario actual
  *     tags: [Sesiones]
  *     security:
  *       - bearerAuth: []
@@ -64,16 +110,10 @@
  *                     $ref: '#/components/schemas/Session'
  *       401:
  *         description: No autorizado
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Email no verificado
  *       500:
  *         description: Error del servidor
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  *
  *   post:
  *     summary: Crea una nueva sesión
@@ -119,6 +159,8 @@
  *               $ref: '#/components/schemas/Error'
  *       401:
  *         description: No autorizado
+ *       403:
+ *         description: Email no verificado
  *       500:
  *         description: Error del servidor
  *
@@ -148,6 +190,10 @@
  *                   example: true
  *                 data:
  *                   $ref: '#/components/schemas/Session'
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada
  *       500:
@@ -178,9 +224,30 @@
  *                 type: string
  *               webhookUrl:
  *                 type: string
+ *               filters:
+ *                 type: object
+ *                 properties:
+ *                   ignoreBroadcast:
+ *                     type: boolean
+ *                   ignoreGroups:
+ *                     type: boolean
+ *                   ignoreNonGroups:
+ *                     type: boolean
+ *                   allowedGroups:
+ *                     type: array
+ *                     items:
+ *                       type: string
+ *                   allowedContacts:
+ *                     type: array
+ *                     items:
+ *                       type: string
  *     responses:
  *       200:
  *         description: Sesión actualizada correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada
  *       500:
@@ -201,12 +268,16 @@
  *     responses:
  *       200:
  *         description: Sesión eliminada correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada
  *       500:
  *         description: Error del servidor
  *
- * /sessions/{sessionId}/listen:
+ * /sessions/{sessionId}/start-listening:
  *   post:
  *     summary: Inicia la escucha de mensajes
  *     tags: [Sesiones]
@@ -222,12 +293,16 @@
  *     responses:
  *       200:
  *         description: Escucha iniciada correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada
  *       500:
  *         description: Error del servidor
  *
- * /sessions/{sessionId}/stop:
+ * /sessions/{sessionId}/stop-listening:
  *   post:
  *     summary: Detiene la escucha de mensajes
  *     tags: [Sesiones]
@@ -243,6 +318,10 @@
  *     responses:
  *       200:
  *         description: Escucha detenida correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada
  *       500:
@@ -264,8 +343,37 @@
  *     responses:
  *       200:
  *         description: Código QR obtenido correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
  *       404:
  *         description: Sesión no encontrada o QR no disponible
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/disconnect:
+ *   post:
+ *     summary: Desconecta una sesión
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Sesión desconectada correctamente
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
+ *       404:
+ *         description: Sesión no encontrada
  *       500:
  *         description: Error del servidor
  */
@@ -281,12 +389,17 @@ const {
   startListening,
   stopListening,
   getQRCode,
-  disconnectSession
+  disconnectSession,
+  getOrCreateSession
 } = require('../controllers/sessionController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect, requireEmailVerification } = require('../middleware/auth');
 
-// Proteger todas las rutas
+// Proteger todas las rutas con autenticación y verificación de email
 router.use(protect);
+//router.use(requireEmailVerification);
+
+// Ruta para obtener o crear una sesión para el usuario actual
+router.post('/user-session', getOrCreateSession);
 
 // Rutas para administrar sesiones
 router.route('/')
@@ -299,8 +412,8 @@ router.route('/:sessionId')
   .delete(deleteSession);
 
 // Rutas específicas
-router.post('/:sessionId/listen', startListening);
-router.post('/:sessionId/stop', stopListening);
+router.post('/:sessionId/start-listening', startListening);
+router.post('/:sessionId/stop-listening', stopListening);
 router.get('/:sessionId/qr', getQRCode);
 router.post('/:sessionId/disconnect', disconnectSession);
 
