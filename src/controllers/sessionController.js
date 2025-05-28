@@ -1082,7 +1082,7 @@ exports.detectDisconnectedSession = asyncHandler(async (req, res, next) => {
     const statusCheck = await Promise.race([
       whatsappClient.getSessionStatus(sessionId),
       new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Timeout')), 5000) // Aumentado timeout
+        setTimeout(() => reject(new Error('Timeout')), 15000) // Aumentado timeout
       )
     ]);
     
