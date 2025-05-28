@@ -5,10 +5,672 @@ const logger = require('../utils/logger');
 const whatsAppSocketBridge = require('../services/whatsAppSocketBridge');
 const asyncHandler = require('../middleware/asyncHandler');
 const ErrorResponse = require('../utils/errorResponse');
+const config = require('../config');
+const mongoose = require('mongoose');
+
+// Constantes de configuración
+const MAX_SESSIONS_PER_USER = parseInt(process.env.MAX_SESSIONS_PER_USER || '3', 10);
+const SESSION_VALIDITY_HOURS = parseInt(process.env.SESSION_VALIDITY_HOURS || '24', 10);
+const SOFT_DELETE_RETENTION_DAYS = parseInt(process.env.SOFT_DELETE_RETENTION_DAYS || '30', 10);
+
 
 // Cache en memoria para evitar verificaciones excesivas
 const sessionStatusCache = new Map();
 const CACHE_TTL = 30000; // 30 segundos
+
+
+
+/**
+ * @desc    Obtener solo sesiones válidas para reconexión
+ * @route   GET /api/v1/sessions/valid
+ * @access  Private
+ */
+exports.getValidSessions = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  
+  logger.info(`Obteniendo sesiones válidas para usuario ${userId}`);
+  
+  // Calcular fecha límite para sesiones válidas
+  const validityLimit = new Date();
+  validityLimit.setHours(validityLimit.getHours() - SESSION_VALIDITY_HOURS);
+  
+  try {
+    // Buscar sesiones válidas
+    const validSessions = await Session.aggregate([
+      { $match: { userId: mongoose.Types.ObjectId(req.user.id), deletedAt: { $exists: false } } },
+      {
+        $addFields: {
+          priority: {
+            $switch: {
+              branches: [
+                { case: { $eq: ['$status', 'connected'] }, then: 3 },
+                { case: { $eq: ['$status', 'qr_ready'] }, then: 2 },
+                {
+                  case: {
+                    $and: [
+                      { $eq: ['$status', 'disconnected'] },
+                      {
+                        $gte: [
+                          { $subtract: [new Date(), '$lastDisconnection'] },
+                          -5 * 60 * 1000 // los últimos 5 minutos
+                        ]
+                      }
+                    ]
+                  },
+                  then: 1
+                }
+              ],
+              default: 0
+            }
+          }
+        }
+      },
+      { $sort: { priority: -1, lastConnection: -1 } }
+    ]);
+    
+    // Validar cada sesión contra el servicio de WhatsApp
+    const validatedSessions = [];
+    
+    for (const session of validSessions) {
+      let validationStatus = 'unknown';
+      let isServiceValid = false;
+      
+      try {
+        // Verificar estado en el servicio con timeout corto
+        const serviceStatus = await Promise.race([
+          whatsappClient.getSessionStatus(session.sessionId),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Timeout')), 3000)
+          )
+        ]);
+        
+        if (serviceStatus && serviceStatus.exists) {
+          isServiceValid = true;
+          validationStatus = serviceStatus.isConnected ? 'connected' : 'exists';
+          
+          // Actualizar estado en BD si es diferente
+          if (session.isConnected !== serviceStatus.isConnected) {
+            await Session.findByIdAndUpdate(session._id, {
+              isConnected: serviceStatus.isConnected,
+              status: serviceStatus.isConnected ? 'connected' : session.status
+            });
+          }
+        } else {
+          validationStatus = 'not_found_in_service';
+        }
+      } catch (error) {
+        validationStatus = 'service_error';
+        logger.debug(`Error al validar sesión ${session.sessionId}: ${error.message}`);
+      }
+      
+      // Calcular puntuación de validez
+      let validityScore = 0;
+      
+      if (isServiceValid) validityScore += 10;
+      if (session.isConnected) validityScore += 8;
+      if (session.status === 'connected') validityScore += 6;
+      if (session.status === 'qr_ready') validityScore += 4;
+      
+      // Puntuación basada en actividad reciente
+      if (session.lastConnection) {
+        const hoursSinceConnection = (Date.now() - new Date(session.lastConnection).getTime()) / (1000 * 60 * 60);
+        if (hoursSinceConnection < 1) validityScore += 5;
+        else if (hoursSinceConnection < 6) validityScore += 3;
+        else if (hoursSinceConnection < 24) validityScore += 1;
+      }
+      
+      if (session.lastQRTimestamp) {
+        const hoursSinceQR = (Date.now() - new Date(session.lastQRTimestamp).getTime()) / (1000 * 60 * 60);
+        if (hoursSinceQR < 0.5) validityScore += 4;
+        else if (hoursSinceQR < 2) validityScore += 2;
+      }
+      
+      // Solo incluir sesiones con puntuación mínima
+      if (validityScore >= 3) {
+        validatedSessions.push({
+          ...session.toObject(),
+          validationStatus,
+          isServiceValid,
+          validityScore,
+          recommendation: validityScore >= 8 ? 'immediate_use' : 
+                         validityScore >= 6 ? 'verify_and_use' : 'needs_validation'
+        });
+      }
+    }
+    
+    // Ordenar por puntuación de validez
+    validatedSessions.sort((a, b) => b.validityScore - a.validityScore);
+    
+    logger.info(`Encontradas ${validatedSessions.length} sesiones válidas de ${validSessions.length} totales para usuario ${userId}`);
+    
+    res.status(200).json({
+      success: true,
+      count: validatedSessions.length,
+      totalFound: validSessions.length,
+      data: validatedSessions,
+      meta: {
+        validityHours: SESSION_VALIDITY_HOURS,
+        maxScorePossible: 29,
+        recommendations: {
+          immediate_use: 'Usar inmediatamente',
+          verify_and_use: 'Verificar estado y usar',
+          needs_validation: 'Requiere validación'
+        }
+      }
+    });
+    
+  } catch (error) {
+    logger.error(`Error al obtener sesiones válidas:`, {
+      errorMessage: error.message,
+      userId
+    });
+    
+    return next(new ErrorResponse('Error al obtener sesiones válidas', 500));
+  }
+});
+
+/**
+ * @desc    Limpiar sesiones expiradas/inválidas (soft delete)
+ * @route   DELETE /api/v1/sessions/cleanup
+ * @access  Private
+ */
+exports.cleanupSessions = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const { force = false, daysOld = 7 } = req.query;
+  
+  logger.info(`Iniciando limpieza de sesiones para usuario ${userId}`, {
+    force: force === 'true',
+    daysOld: parseInt(daysOld)
+  });
+  
+  try {
+    const daysToCheck = parseInt(daysOld);
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysToCheck);
+    
+    // Criterios para sesiones a limpiar
+    const cleanupCriteria = {
+      userId,
+      deletedAt: { $exists: false }, // No ya eliminadas
+      $or: []
+    };
+    
+    // Sesiones con estado fallido
+    cleanupCriteria.$or.push({ status: 'failed' });
+    
+    // Sesiones inicializando por más tiempo del permitido
+    cleanupCriteria.$or.push({
+      status: 'initializing',
+      createdAt: { $lt: cutoffDate }
+    });
+    
+    // Sesiones desconectadas hace mucho tiempo
+    cleanupCriteria.$or.push({
+      status: 'disconnected',
+      lastDisconnection: { $lt: cutoffDate }
+    });
+    
+    if (force === 'true') {
+      // En modo forzado, también limpiar sesiones inactivas
+      cleanupCriteria.$or.push({
+        status: { $in: ['qr_ready', 'connected'] },
+        $and: [
+          {
+            $or: [
+              { lastConnection: { $lt: cutoffDate } },
+              { lastConnection: { $exists: false } }
+            ]
+          },
+          {
+            $or: [
+              { lastQRTimestamp: { $lt: cutoffDate } },
+              { lastQRTimestamp: { $exists: false } }
+            ]
+          }
+        ]
+      });
+    }
+    
+    // Encontrar sesiones a limpiar
+    const sessionsToCleanup = await Session.find(cleanupCriteria);
+    
+    if (sessionsToCleanup.length === 0) {
+      return res.status(200).json({
+        success: true,
+        message: 'No hay sesiones que limpiar',
+        cleaned: 0,
+        details: []
+      });
+    }
+    
+    const cleanupResults = [];
+    let cleanedCount = 0;
+    
+    for (const session of sessionsToCleanup) {
+      try {
+        // Intentar desconectar del servicio de WhatsApp
+        try {
+          await whatsappClient.disconnectSession(session.sessionId);
+          logger.debug(`Sesión ${session.sessionId} desconectada del servicio`);
+        } catch (disconnectError) {
+          logger.debug(`Error al desconectar ${session.sessionId} (esperado): ${disconnectError.message}`);
+        }
+        
+        // Desuscribir del puente de sockets
+        whatsAppSocketBridge.unsubscribeFromSession(session.sessionId);
+        socketService.stopQRPolling(session.sessionId);
+        
+        // Soft delete: marcar como eliminada
+        await Session.findByIdAndUpdate(session._id, {
+          deletedAt: new Date(),
+          status: 'deleted',
+          isConnected: false,
+          isListening: false,
+          cleanupReason: force === 'true' ? 'force_cleanup' : 'auto_cleanup'
+        });
+        
+        cleanedCount++;
+        cleanupResults.push({
+          sessionId: session.sessionId,
+          name: session.name,
+          status: session.status,
+          reason: 'cleaned_successfully',
+          lastActivity: session.lastConnection || session.lastQRTimestamp || session.createdAt
+        });
+        
+        // Notificar a clientes conectados
+        socketService.emitToSession(session.sessionId, 'session_cleaned', {
+          sessionId: session.sessionId,
+          timestamp: Date.now(),
+          reason: 'cleanup'
+        });
+        
+      } catch (error) {
+        logger.error(`Error al limpiar sesión ${session.sessionId}:`, {
+          errorMessage: error.message
+        });
+        
+        cleanupResults.push({
+          sessionId: session.sessionId,
+          name: session.name,
+          status: session.status,
+          reason: 'cleanup_error',
+          error: error.message
+        });
+      }
+    }
+    
+    logger.info(`Limpieza completada: ${cleanedCount}/${sessionsToCleanup.length} sesiones limpiadas para usuario ${userId}`);
+    
+    res.status(200).json({
+      success: true,
+      message: `Limpieza completada: ${cleanedCount} sesiones procesadas`,
+      cleaned: cleanedCount,
+      total: sessionsToCleanup.length,
+      details: cleanupResults,
+      criteria: {
+        daysOld: daysToCheck,
+        force: force === 'true',
+        cutoffDate
+      }
+    });
+    
+  } catch (error) {
+    logger.error(`Error durante limpieza de sesiones:`, {
+      errorMessage: error.message,
+      userId
+    });
+    
+    return next(new ErrorResponse('Error durante la limpieza de sesiones', 500));
+  }
+});
+
+/**
+ * @desc    Obtener sesiones con filtros avanzados y paginación
+ * @route   GET /api/v1/sessions
+ * @access  Private
+ */
+exports.getAllSessionsEnhanced = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  const {
+    status,
+    reconnectable,
+    page = 1,
+    limit = 10,
+    sortBy = 'lastActivity',
+    sortOrder = 'desc',
+    includeDeleted = false
+  } = req.query;
+  
+  // Construir filtros
+  const filters = { userId };
+
+  if (includeDeleted !== 'true') {
+    filters.deletedAt = { $exists: false };
+  }
+  if (status) {
+    const statusArray = status.split(',');
+    filters.status = { $in: statusArray };
+  }
+  if (reconnectable === 'true') {
+    const recentLimit = new Date();
+    recentLimit.setHours(recentLimit.getHours() - SESSION_VALIDITY_HOURS);
+    filters.$or = [
+      {
+        status: 'connected',
+        isConnected: true,
+        lastConnection: { $gte: recentLimit }
+      },
+      {
+        status: 'qr_ready',
+        lastQRTimestamp: { $gte: recentLimit }
+      }
+    ];
+  }
+
+  // Paginación
+  const pageNum = Math.max(1, parseInt(page));
+  const limitNum = Math.min(50, Math.max(1, parseInt(limit)));
+  const skip = (pageNum - 1) * limitNum;
+
+  let sessions, totalCount;
+
+  try {
+    // Trae sesiones SIN sort si es por "lastActivity", con paginación
+    if (sortBy === 'lastActivity') {
+      [sessions, totalCount] = await Promise.all([
+        Session.find(filters)
+          .select('-__v')
+          .skip(skip)
+          .limit(limitNum)
+          .lean(),
+        Session.countDocuments(filters)
+      ]);
+
+      // Ordenar en JS por "lastActivity"
+      sessions.sort((a, b) => {
+        const aActivity = Math.max(
+          a.lastConnection ? new Date(a.lastConnection).getTime() : 0,
+          a.lastQRTimestamp ? new Date(a.lastQRTimestamp).getTime() : 0,
+          new Date(a.createdAt).getTime()
+        );
+        const bActivity = Math.max(
+          b.lastConnection ? new Date(b.lastConnection).getTime() : 0,
+          b.lastQRTimestamp ? new Date(b.lastQRTimestamp).getTime() : 0,
+          new Date(b.createdAt).getTime()
+        );
+        return sortOrder === 'asc' ? aActivity - bActivity : bActivity - aActivity;
+      });
+
+    } else {
+      // Para otros casos, dejar sort normal
+      const sortOptions = {};
+      switch (sortBy) {
+        case 'lastConnection':
+          sortOptions.lastConnection = sortOrder === 'asc' ? 1 : -1;
+          break;
+        case 'createdAt':
+          sortOptions.createdAt = sortOrder === 'asc' ? 1 : -1;
+          break;
+        case 'name':
+          sortOptions.name = sortOrder === 'asc' ? 1 : -1;
+          break;
+        default:
+          sortOptions.createdAt = -1;
+      }
+
+      [sessions, totalCount] = await Promise.all([
+        Session.find(filters)
+          .select('-__v')
+          .sort(sortOptions)
+          .skip(skip)
+          .limit(limitNum)
+          .lean(),
+        Session.countDocuments(filters)
+      ]);
+    }
+
+    // Paginación info
+    const totalPages = Math.ceil(totalCount / limitNum);
+    const hasNextPage = pageNum < totalPages;
+    const hasPrevPage = pageNum > 1;
+
+    // Enriquecer datos
+    const now = Date.now();
+    const enrichedSessions = sessions.map(session => {
+      const lastActivity = Math.max(
+        session.lastConnection ? new Date(session.lastConnection).getTime() : 0,
+        session.lastQRTimestamp ? new Date(session.lastQRTimestamp).getTime() : 0,
+        new Date(session.createdAt).getTime()
+      );
+      const hoursSinceActivity = (now - lastActivity) / (1000 * 60 * 60);
+      return {
+        ...session,
+        lastActivity: new Date(lastActivity),
+        hoursSinceActivity: Math.round(hoursSinceActivity * 10) / 10,
+        isRecentlyActive: hoursSinceActivity < SESSION_VALIDITY_HOURS,
+        canReconnect: (session.status === 'connected' || session.status === 'qr_ready') && 
+                     hoursSinceActivity < SESSION_VALIDITY_HOURS
+      };
+    });
+
+    logger.info(`Sesiones obtenidas con filtros para usuario ${userId}`, {
+      totalCount,
+      returnedCount: sessions.length,
+      filters: { status, reconnectable, includeDeleted }
+    });
+
+    res.status(200).json({
+      success: true,
+      data: enrichedSessions,
+      pagination: {
+        current: pageNum,
+        total: totalPages,
+        limit: limitNum,
+        totalCount,
+        hasNextPage,
+        hasPrevPage,
+        nextPage: hasNextPage ? pageNum + 1 : null,
+        prevPage: hasPrevPage ? pageNum - 1 : null
+      },
+      filters: {
+        status,
+        reconnectable,
+        includeDeleted,
+        sortBy,
+        sortOrder
+      }
+    });
+
+  } catch (error) {
+    logger.error(`Error al obtener sesiones con filtros:`, {
+      errorMessage: error.message,
+      userId,
+      filters
+    });
+    return next(new ErrorResponse('Error al obtener sesiones', 500));
+  }
+});
+
+
+/**
+ * @desc    Middleware para validar límite de sesiones activas
+ * @access  Private
+ */
+exports.validateSessionLimit = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  
+  // Solo aplicar el límite en creación de nuevas sesiones
+  if (req.method !== 'POST' || !req.path.includes('sessions')) {
+    return next();
+  }
+  
+  try {
+    const activeSessionsCount = await Session.countDocuments({
+      userId,
+      deletedAt: { $exists: false },
+      status: { $in: ['connected', 'qr_ready', 'initializing'] }
+    });
+    
+    if (activeSessionsCount >= MAX_SESSIONS_PER_USER) {
+      logger.warn(`Usuario ${userId} intentó crear sesión excediendo límite`, {
+        currentCount: activeSessionsCount,
+        maxAllowed: MAX_SESSIONS_PER_USER
+      });
+      
+      return next(new ErrorResponse(
+        `No puedes tener más de ${MAX_SESSIONS_PER_USER} sesiones activas simultáneamente. ` +
+        `Actualmente tienes ${activeSessionsCount}. Elimina sesiones inactivas primero.`,
+        400
+      ));
+    }
+    
+    // Agregar información al request para uso posterior
+    req.sessionInfo = {
+      currentActiveCount: activeSessionsCount,
+      maxAllowed: MAX_SESSIONS_PER_USER,
+      remaining: MAX_SESSIONS_PER_USER - activeSessionsCount
+    };
+    
+    next();
+    
+  } catch (error) {
+    logger.error(`Error al validar límite de sesiones:`, {
+      errorMessage: error.message,
+      userId
+    });
+    
+    return next(new ErrorResponse('Error al validar límite de sesiones', 500));
+  }
+});
+
+/**
+ * @desc    Middleware para verificar pertenencia de sesión al usuario
+ * @access  Private
+ */
+exports.validateSessionOwnership = asyncHandler(async (req, res, next) => {
+  const { sessionId } = req.params;
+  const userId = req.user.id;
+  
+  if (!sessionId) {
+    return next(new ErrorResponse('ID de sesión requerido', 400));
+  }
+  
+  try {
+    const session = await Session.findOne({
+      sessionId,
+      userId,
+      deletedAt: { $exists: false }
+    }).select('sessionId userId status');
+    
+    if (!session) {
+      return next(new ErrorResponse('Sesión no encontrada o no tienes permisos para acceder', 404));
+    }
+    
+    // Agregar sesión al request para evitar consultas duplicadas
+    req.session = session;
+    
+    next();
+    
+  } catch (error) {
+    logger.error(`Error al verificar pertenencia de sesión:`, {
+      errorMessage: error.message,
+      sessionId,
+      userId
+    });
+    
+    return next(new ErrorResponse('Error al verificar permisos de sesión', 500));
+  }
+});
+
+/**
+ * @desc    Obtener estadísticas de sesiones del usuario
+ * @route   GET /api/v1/sessions/stats
+ * @access  Private
+ */
+exports.getSessionStats = asyncHandler(async (req, res, next) => {
+  const userId = req.user.id;
+  
+  try {
+    const [totalStats, statusStats, recentActivity] = await Promise.all([
+      // Estadísticas totales
+      Session.aggregate([
+        { 
+          $match: { 
+            userId: new mongoose.Types.ObjectId(userId),
+            deletedAt: { $exists: false }
+          }
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: 1 },
+            connected: {
+              $sum: { $cond: [{ $eq: ["$status", "connected"] }, 1, 0] }
+            },
+            listening: {
+              $sum: { $cond: ["$isListening", 1, 0] }
+            }
+          }
+        }
+      ]),
+      
+      // Estadísticas por estado
+      Session.aggregate([
+        { 
+          $match: { 
+            userId: new mongoose.Types.ObjectId(userId),
+            deletedAt: { $exists: false }
+          }
+        },
+        {
+          $group: {
+            _id: "$status",
+            count: { $sum: 1 }
+          }
+        }
+      ]),
+      
+      // Actividad reciente (últimas 24 horas)
+      Session.find({
+        userId,
+        deletedAt: { $exists: false },
+        $or: [
+          { lastConnection: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+          { lastQRTimestamp: { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } }
+        ]
+      }).countDocuments()
+    ]);
+    
+    const stats = totalStats[0] || { total: 0, connected: 0, listening: 0 };
+    const statusBreakdown = statusStats.reduce((acc, item) => {
+      acc[item._id] = item.count;
+      return acc;
+    }, {});
+    
+    res.status(200).json({
+      success: true,
+      data: {
+        total: stats.total,
+        connected: stats.connected,
+        listening: stats.listening,
+        recentlyActive: recentActivity,
+        maxAllowed: MAX_SESSIONS_PER_USER,
+        remaining: Math.max(0, MAX_SESSIONS_PER_USER - stats.total),
+        statusBreakdown,
+        validityHours: SESSION_VALIDITY_HOURS
+      }
+    });
+    
+  } catch (error) {
+    logger.error(`Error al obtener estadísticas de sesiones:`, {
+      errorMessage: error.message,
+      userId
+    });
+    
+    return next(new ErrorResponse('Error al obtener estadísticas', 500));
+  }
+});
 
 // Obtener todas las sesiones del usuario autenticado
 exports.getAllSessions = asyncHandler(async (req, res, next) => {
@@ -309,7 +971,7 @@ exports.getOrCreateSession = asyncHandler(async (req, res, next) => {
   // 🆕 Solo crear nueva sesión si NO hay sesiones recientes válidas
   logger.info(`🆕 Creando nueva sesión para usuario ${userId}`);
   
-  const sessionId = `session-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+  const sessionId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   
   const session = await Session.create({
     sessionId,

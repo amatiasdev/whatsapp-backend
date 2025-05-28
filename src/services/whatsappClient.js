@@ -10,7 +10,7 @@ const logger = require('../utils/logger');
 class WhatsAppClient {
   constructor() {
     this.baseURL = config.whatsappServiceUrl; // http://localhost:3001
-    this.timeout = 120000; // 30 segundos
+    this.timeout = 1200000; // 30 segundos
   }
 
   /**

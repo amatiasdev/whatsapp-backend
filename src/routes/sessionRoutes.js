@@ -771,51 +771,73 @@ const {
   restoreSessions,
   quickSessionStatus,
   wakeUpSession,
-  cleanupOrphanedSessions  
+  cleanupOrphanedSessions,
+  getValidSessions,
+  cleanupSessions,
+  getAllSessionsEnhanced,
+  validateSessionLimit,
+  validateSessionOwnership,
+  getSessionStats  
 } = require('../controllers/sessionController');
 const { protect, requireEmailVerification } = require('../middleware/auth');
 
 // Proteger todas las rutas con autenticación
 router.use(protect);
-// Descomentar la siguiente línea si requieres verificación de email
-// router.use(requireEmailVerification);
+
+// ========================================
+// ENDPOINTS SIN PARÁMETROS (van primero)
+// ========================================
+
+// Endpoint para obtener solo sesiones válidas para reconexión
+router.get('/valid', getValidSessions);
+
+// Endpoint para obtener estadísticas de sesiones
+router.get('/stats', getSessionStats);
+
+// Endpoint para limpiar sesiones expiradas/inválidas
+router.delete('/cleanup', cleanupSessions);
 
 // Endpoint específico para restaurar estado de sesión al recargar página
 router.get('/restore', restoreSessions);
 
 // Ruta para obtener o crear una sesión para el usuario actual
-router.post('/user-session', getOrCreateSession);
+router.post('/user-session', validateSessionLimit, getOrCreateSession);
 
-// Rutas para administrar sesiones
+// Rutas para administrar sesiones - MEJORADAS CON FILTROS
 router.route('/')
-  .get(getAllSessions)
-  .post(createSession);
+  .get(getAllSessionsEnhanced) // Reemplazada con versión mejorada
+  .post(validateSessionLimit, createSession); // Agregado middleware de validación
 
-router.route('/:sessionId')
-  .get(getSessionById)
-  .put(updateSession)
-  .delete(deleteSession);
+// ========================================
+// ENDPOINTS CON PARÁMETROS (van después)
+// ========================================
 
 // Endpoint rápido para verificar si una sesión específica sigue activa
-router.get('/:sessionId/quick-status', quickSessionStatus);
+// DEBE IR ANTES del middleware de validación de ownership
+router.get('/:sessionId/quick-status', validateSessionOwnership, quickSessionStatus);
 
 // Endpoint para "despertar" una sesión dormida
-router.post('/:sessionId/wake-up', wakeUpSession);
-
-// APLICAR middleware de detección solo a rutas específicas que lo necesitan
-// El middleware debe ir ANTES de las rutas que lo usan
-router.get('/:sessionId/chats', detectDisconnectedSession, getSessionChats);
-router.put('/:sessionId/chats/:chatId/listening', detectDisconnectedSession, updateChatListeningStatus);
-router.post('/:sessionId/start-listening', detectDisconnectedSession, startListening);
-router.post('/:sessionId/stop-listening', detectDisconnectedSession, stopListening);
-
-// Rutas que NO necesitan middleware de detección
-router.get('/:sessionId/qr', getQRCode);
-router.post('/:sessionId/disconnect', disconnectSession);
+router.post('/:sessionId/wake-up', validateSessionOwnership, wakeUpSession);
 
 // Rutas de mantenimiento y control de sesiones
-router.post('/:sessionId/force-reinit', forceReinitializeSession);
-router.get('/:sessionId/sync-status', checkAndSyncSessionStatus);
-router.post('/:sessionId/auto-reinit', autoReinitializeSession);
+router.post('/:sessionId/force-reinit', validateSessionOwnership, forceReinitializeSession);
+router.get('/:sessionId/sync-status', validateSessionOwnership, checkAndSyncSessionStatus);
+router.post('/:sessionId/auto-reinit', validateSessionOwnership, autoReinitializeSession);
+
+// RUTAS QUE REQUIEREN DETECCIÓN DE SESIÓN DESCONECTADA
+router.get('/:sessionId/chats', validateSessionOwnership, detectDisconnectedSession, getSessionChats);
+router.put('/:sessionId/chats/:chatId/listening', validateSessionOwnership, detectDisconnectedSession, updateChatListeningStatus);
+router.post('/:sessionId/start-listening', validateSessionOwnership, detectDisconnectedSession, startListening);
+router.post('/:sessionId/stop-listening', validateSessionOwnership, detectDisconnectedSession, stopListening);
+
+// Rutas que NO necesitan middleware de detección pero SÍ validación de ownership
+router.get('/:sessionId/qr', validateSessionOwnership, getQRCode);
+router.post('/:sessionId/disconnect', validateSessionOwnership, disconnectSession);
+
+// Rutas básicas de CRUD (van al final)
+router.route('/:sessionId')
+  .get(validateSessionOwnership, getSessionById)
+  .put(validateSessionOwnership, updateSession)
+  .delete(validateSessionOwnership, deleteSession);
 
 module.exports = router;
