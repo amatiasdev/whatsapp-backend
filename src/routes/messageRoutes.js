@@ -232,6 +232,8 @@ const {
   processIncomingMessages,
   getMessages,
   getChats,
+  getWhatsAppChats, // NUEVO: Chats desde WhatsApp Web
+  getWhatsAppChatsBasic, // NUEVO: Chats básicos desde WhatsApp Web
   sendTextMessage,
   sendMediaMessage,
   deleteOldMessages
@@ -248,11 +250,101 @@ router.use(protect);
 router.get('/sessions/:sessionId/chats', getChats);
 router.get('/sessions/:sessionId/chats/:chatId/messages', getMessages);
 
+/**
+ * @route GET /api/messages/sessions/:sessionId/whatsapp-chats
+ * @description Obtiene la lista de chats directamente desde WhatsApp Web
+ * @param {string} sessionId - ID de la sesión
+ * @query {string} refresh - 'true' para forzar actualización
+ * @query {string} limit - Número de chats (default: 50, max: 100)
+ * @query {string} offset - Offset para paginación (default: 0)
+ * @query {string} basic - 'true' para modo básico sin fotos
+ */
+// Rutas para obtener chats directamente desde WhatsApp Web
+router.get('/sessions/:sessionId/whatsapp-chats', getWhatsAppChats); // Chats completos desde WhatsApp
+
+
+/**
+ * @route GET /api/messages/sessions/:sessionId/whatsapp-chats/basic
+ * @description Obtiene chats básicos desde WhatsApp Web (más rápido)
+ * @param {string} sessionId - ID de la sesión
+ * @query {string} limit - Número de chats (default: 20, max: 50)
+ * @query {string} offset - Offset para paginación (default: 0)
+ */
+router.get('/sessions/:sessionId/whatsapp-chats/basic', getWhatsAppChatsBasic); // Chats básicos desde WhatsApp
+
 // Rutas para enviar mensajes
 router.post('/sessions/:sessionId/send/message', sendTextMessage);
 router.post('/sessions/:sessionId/send/:mediaType', sendMediaMessage);
 
 // Rutas para mantenimiento
 router.post('/sessions/:sessionId/cleanup', deleteOldMessages);
+
+
+/**
+ * @route GET /api/whatsapp/sessions/:sessionId/chats
+ * @description Obtiene la lista de chats para una sesión
+ */
+router.get('/sessions/:sessionId/chats', async (req, res) => {
+  const { sessionId } = req.params;
+  const { refresh } = req.query;
+  const forceRefresh = refresh === 'true';
+  
+  try {
+    const result = await whatsappClient.getSessionChats(sessionId, forceRefresh);
+    return res.json(result);
+  } catch (error) {
+    logger.error(`Error al obtener chats para sesión ${sessionId}:`, error);
+    
+    // Si el servicio de WhatsApp devuelve un código de error específico, usarlo
+    if (error.response?.status) {
+      return res.status(error.response.status).json({
+        status: 'error',
+        message: error.response.data?.message || error.message
+      });
+    }
+    
+    return res.status(500).json({
+      status: 'error',
+      message: error.message || 'Error interno del servidor'
+    });
+  }
+});
+
+/**
+ * @route PUT /api/whatsapp/sessions/:sessionId/chats/:chatId/listening
+ * @description Actualiza el estado de escucha de un chat específico
+ */
+router.put('/sessions/:sessionId/chats/:chatId/listening', async (req, res) => {
+  const { sessionId, chatId } = req.params;
+  const { isListening } = req.body;
+  
+  // Validar parámetros
+  if (isListening === undefined || typeof isListening !== 'boolean') {
+    return res.status(400).json({
+      status: 'error',
+      message: 'Se requiere el parámetro isListening (boolean)'
+    });
+  }
+  
+  try {
+    const result = await whatsappClient.updateChatListeningStatus(sessionId, chatId, isListening);
+    return res.json(result);
+  } catch (error) {
+    logger.error(`Error al actualizar estado de escucha para chat ${chatId} en sesión ${sessionId}:`, error);
+    
+    // Si el servicio de WhatsApp devuelve un código de error específico, usarlo
+    if (error.response?.status) {
+      return res.status(error.response.status).json({
+        status: 'error',
+        message: error.response.data?.message || error.message
+      });
+    }
+    
+    return res.status(500).json({
+      status: 'error',
+      message: error.message || 'Error interno del servidor'
+    });
+  }
+});
 
 module.exports = router;

@@ -29,6 +29,62 @@
  *         userId:
  *           type: string
  *           description: ID del usuario propietario de la sesión
+ *         lastConnection:
+ *           type: string
+ *           format: date-time
+ *           description: Última vez que la sesión se conectó
+ *         lastQRTimestamp:
+ *           type: string
+ *           format: date-time
+ *           description: Última vez que se generó un código QR
+ *         createdAt:
+ *           type: string
+ *           format: date-time
+ *           description: Fecha de creación de la sesión
+ *     
+ *     SessionAnalysis:
+ *       type: object
+ *       properties:
+ *         sessionId:
+ *           type: string
+ *         name:
+ *           type: string
+ *         status:
+ *           type: string
+ *         isConnected:
+ *           type: boolean
+ *         isListening:
+ *           type: boolean
+ *         recommendation:
+ *           type: string
+ *           enum: [use_immediately, qr_still_valid, verify_and_use, likely_active, check_status, unknown]
+ *         priority:
+ *           type: integer
+ *           minimum: 0
+ *           maximum: 10
+ *     
+ *     RestoreResponse:
+ *       type: object
+ *       properties:
+ *         success:
+ *           type: boolean
+ *         data:
+ *           type: object
+ *           properties:
+ *             activeSessions:
+ *               type: array
+ *               items:
+ *                 $ref: '#/components/schemas/SessionAnalysis'
+ *             recommendedAction:
+ *               type: string
+ *               enum: [create_new, restore_session, show_qr, verify_session]
+ *             recommendedSessionId:
+ *               type: string
+ *               nullable: true
+ *             message:
+ *               type: string
+ *             timestamp:
+ *               type: integer
  *     
  *     Error:
  *       type: object
@@ -39,6 +95,24 @@
  *         error:
  *           type: string
  *           description: Mensaje de error
+ *
+ * /sessions/restore:
+ *   get:
+ *     summary: Restaura sesiones disponibles al recargar la página
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Análisis de sesiones disponibles para restaurar
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/RestoreResponse'
+ *       401:
+ *         description: No autorizado
+ *       500:
+ *         description: Error del servidor
  *
  * /sessions/user-session:
  *   post:
@@ -62,6 +136,8 @@
  *                 isExisting:
  *                   type: boolean
  *                   example: true
+ *                 message:
+ *                   type: string
  *       201:
  *         description: Nueva sesión creada
  *         content:
@@ -277,6 +353,84 @@
  *       500:
  *         description: Error del servidor
  *
+ * /sessions/{sessionId}/quick-status:
+ *   get:
+ *     summary: Verificación rápida del estado de una sesión específica
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Estado de la sesión verificado
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 status:
+ *                   type: string
+ *                   enum: [active, qr_ready, uncertain, not_found]
+ *                 isConnected:
+ *                   type: boolean
+ *                 message:
+ *                   type: string
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/wake-up:
+ *   post:
+ *     summary: Despierta una sesión dormida y reestablece suscripciones
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Sesión despertada exitosamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                     status:
+ *                       type: string
+ *                     isConnected:
+ *                       type: boolean
+ *                     isListening:
+ *                       type: boolean
+ *                     statusVerified:
+ *                       type: boolean
+ *                     message:
+ *                       type: string
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
+ *
  * /sessions/{sessionId}/start-listening:
  *   post:
  *     summary: Inicia la escucha de mensajes
@@ -293,6 +447,8 @@
  *     responses:
  *       200:
  *         description: Escucha iniciada correctamente
+ *       400:
+ *         description: Sesión no está conectada o no válida
  *       401:
  *         description: No autorizado
  *       403:
@@ -318,6 +474,8 @@
  *     responses:
  *       200:
  *         description: Escucha detenida correctamente
+ *       400:
+ *         description: Sesión no válida
  *       401:
  *         description: No autorizado
  *       403:
@@ -343,6 +501,23 @@
  *     responses:
  *       200:
  *         description: Código QR obtenido correctamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                     qr:
+ *                       type: string
+ *                       description: Código QR en formato base64
+ *       400:
+ *         description: Sesión ya conectada o QR no disponible
  *       401:
  *         description: No autorizado
  *       403:
@@ -376,6 +551,202 @@
  *         description: Sesión no encontrada
  *       500:
  *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/chats:
+ *   get:
+ *     summary: Obtiene todos los chats de una sesión
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *       - in: query
+ *         name: refresh
+ *         schema:
+ *           type: boolean
+ *         description: Si es true, fuerza la actualización de la caché
+ *     responses:
+ *       200:
+ *         description: Lista de chats obtenida correctamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     chats:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                     count:
+ *                       type: integer
+ *       400:
+ *         description: Sesión no válida o desconectada
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/chats/{chatId}/listening:
+ *   put:
+ *     summary: Actualiza el estado de escucha de un chat
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *       - in: path
+ *         name: chatId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador del chat
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - isListening
+ *             properties:
+ *               isListening:
+ *                 type: boolean
+ *                 description: Si debe escuchar el chat
+ *     responses:
+ *       200:
+ *         description: Estado de escucha actualizado correctamente
+ *       400:
+ *         description: Datos inválidos o sesión no válida
+ *       401:
+ *         description: No autorizado
+ *       403:
+ *         description: Email no verificado o acceso denegado
+ *       404:
+ *         description: Sesión o chat no encontrado
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/force-reinit:
+ *   post:
+ *     summary: Fuerza la reinicialización de una sesión
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Sesión reinicializada correctamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   $ref: '#/components/schemas/Session'
+ *                 message:
+ *                   type: string
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/sync-status:
+ *   get:
+ *     summary: Sincroniza el estado de la sesión con el servicio de WhatsApp
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Estado sincronizado correctamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     sessionId:
+ *                       type: string
+ *                     currentStatus:
+ *                       type: object
+ *                     serviceStatus:
+ *                       type: object
+ *                     wasSynced:
+ *                       type: boolean
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
+ *
+ * /sessions/{sessionId}/auto-reinit:
+ *   post:
+ *     summary: Reinicializa automáticamente una sesión desconectada
+ *     tags: [Sesiones]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: sessionId
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: Identificador de la sesión
+ *     responses:
+ *       200:
+ *         description: Sesión reinicializada automáticamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 data:
+ *                   $ref: '#/components/schemas/Session'
+ *                 message:
+ *                   type: string
+ *       404:
+ *         description: Sesión no encontrada
+ *       500:
+ *         description: Error del servidor
  */
 
 const express = require('express');
@@ -390,13 +761,27 @@ const {
   stopListening,
   getQRCode,
   disconnectSession,
-  getOrCreateSession
+  getOrCreateSession,
+  getSessionChats,
+  updateChatListeningStatus,
+  forceReinitializeSession,
+  checkAndSyncSessionStatus,
+  autoReinitializeSession,
+  detectDisconnectedSession,
+  restoreSessions,
+  quickSessionStatus,
+  wakeUpSession,
+  cleanupOrphanedSessions  
 } = require('../controllers/sessionController');
 const { protect, requireEmailVerification } = require('../middleware/auth');
 
-// Proteger todas las rutas con autenticación y verificación de email
+// Proteger todas las rutas con autenticación
 router.use(protect);
-//router.use(requireEmailVerification);
+// Descomentar la siguiente línea si requieres verificación de email
+// router.use(requireEmailVerification);
+
+// Endpoint específico para restaurar estado de sesión al recargar página
+router.get('/restore', restoreSessions);
 
 // Ruta para obtener o crear una sesión para el usuario actual
 router.post('/user-session', getOrCreateSession);
@@ -411,10 +796,26 @@ router.route('/:sessionId')
   .put(updateSession)
   .delete(deleteSession);
 
-// Rutas específicas
-router.post('/:sessionId/start-listening', startListening);
-router.post('/:sessionId/stop-listening', stopListening);
+// Endpoint rápido para verificar si una sesión específica sigue activa
+router.get('/:sessionId/quick-status', quickSessionStatus);
+
+// Endpoint para "despertar" una sesión dormida
+router.post('/:sessionId/wake-up', wakeUpSession);
+
+// APLICAR middleware de detección solo a rutas específicas que lo necesitan
+// El middleware debe ir ANTES de las rutas que lo usan
+router.get('/:sessionId/chats', detectDisconnectedSession, getSessionChats);
+router.put('/:sessionId/chats/:chatId/listening', detectDisconnectedSession, updateChatListeningStatus);
+router.post('/:sessionId/start-listening', detectDisconnectedSession, startListening);
+router.post('/:sessionId/stop-listening', detectDisconnectedSession, stopListening);
+
+// Rutas que NO necesitan middleware de detección
 router.get('/:sessionId/qr', getQRCode);
 router.post('/:sessionId/disconnect', disconnectSession);
+
+// Rutas de mantenimiento y control de sesiones
+router.post('/:sessionId/force-reinit', forceReinitializeSession);
+router.get('/:sessionId/sync-status', checkAndSyncSessionStatus);
+router.post('/:sessionId/auto-reinit', autoReinitializeSession);
 
 module.exports = router;
