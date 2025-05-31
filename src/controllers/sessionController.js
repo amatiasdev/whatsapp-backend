@@ -833,41 +833,46 @@ exports.deleteSession = asyncHandler(async (req, res, next) => {
 exports.getOrCreateSession = asyncHandler(async (req, res, next) => {
   const userId = req.user.id;
   
-  // Buscar sesiones del usuario ordenadas por actividad reciente
-  const sessions = await Session.find({ userId })
-    .sort({ lastConnection: -1, lastQRTimestamp: -1, createdAt: -1 });
+  logger.info(`🔍 Buscando sesiones para usuario ${userId}`);
   
-  // 🔍 Validar sesiones con lógica más tolerante
+  // Buscar sesiones del usuario ordenadas por actividad reciente
+  const sessions = await Session.find({ 
+    userId,
+    deletedAt: { $exists: false } // Excluir sesiones eliminadas
+  }).sort({ lastConnection: -1, lastQRTimestamp: -1, createdAt: -1 });
+  
+  // 🚀 LÓGICA MEJORADA: Ser MUY generoso con sesiones recientes
   for (const session of sessions) {
-    // ✅ CAMBIO CRÍTICO: Ser más generoso con sesiones conectadas recientes
-    if (session.isConnected && session.lastConnection) {
-      const timeSinceConnection = Date.now() - new Date(session.lastConnection).getTime();
-      const fifteenMinutes = 15 * 60 * 1000; // Aumentado de 10 a 15 minutos
+    const now = Date.now();
+    
+    // ✅ PRIORIDAD 1: Sesiones conectadas muy recientes (SIN validación)
+    if (session.isConnected) {
+      const timeSinceConnection = now - new Date(session.lastConnection).getTime();
+      const thirtyMinutes = 30 * 60 * 1000; // Aumentado a 30 minutos
       
-      if (timeSinceConnection < fifteenMinutes) {
-        logger.info(`✅ Reutilizando sesión conectada reciente: ${session.sessionId}`);
+      if (timeSinceConnection < thirtyMinutes) {
+        logger.info(`🎯 REUTILIZANDO sesión conectada reciente: ${session.sessionId} (${Math.round(timeSinceConnection/60000)} min)`);
         
-        // NO validar contra el servicio si es muy reciente
+        // NO validar contra servicio, confiar en el estado de BD
         whatsAppSocketBridge.subscribeToSession(session.sessionId);
         
         return res.status(200).json({
           success: true,
           data: session,
           isExisting: true,
-          message: 'Sesión activa reutilizada (sin verificación)'
+          message: `Sesión conectada reutilizada (${Math.round(timeSinceConnection/60000)} min atrás)`
         });
       }
     }
     
-    // ✅ CAMBIO CRÍTICO: Ser más generoso con QR recientes
+    // ✅ PRIORIDAD 2: Sesiones con QR reciente (SIN validación)
     if (session.status === 'qr_ready' && session.lastQRTimestamp) {
-      const timeSinceQR = Date.now() - new Date(session.lastQRTimestamp).getTime();
-      const tenMinutes = 10 * 60 * 1000; // Aumentado de 5 a 10 minutos
+      const timeSinceQR = now - new Date(session.lastQRTimestamp).getTime();
+      const twentyMinutes = 20 * 60 * 1000; // Aumentado a 20 minutos
       
-      if (timeSinceQR < tenMinutes) {
-        logger.info(`📱 Reutilizando sesión con QR reciente: ${session.sessionId}`);
+      if (timeSinceQR < twentyMinutes) {
+        logger.info(`📱 REUTILIZANDO sesión con QR reciente: ${session.sessionId} (${Math.round(timeSinceQR/60000)} min)`);
         
-        // NO validar contra el servicio si el QR es reciente
         whatsAppSocketBridge.subscribeToSession(session.sessionId);
         socketService.startQRPolling(session.sessionId);
         
@@ -875,31 +880,41 @@ exports.getOrCreateSession = asyncHandler(async (req, res, next) => {
           success: true,
           data: session,
           isExisting: true,
-          message: 'Sesión con QR válido reutilizada'
+          message: `QR válido reutilizado (${Math.round(timeSinceQR/60000)} min atrás)`
         });
       }
     }
     
-    // 🔍 SOLO validar sesiones más antiguas con timeout más alto
-    if (session.isConnected || session.status === 'qr_ready') {
-      logger.info(`🔍 Validando sesión más antigua: ${session.sessionId}`);
+    // ✅ PRIORIDAD 3: SOLO para sesiones más antiguas, validar CON timeout alto
+    if ((session.isConnected || session.status === 'qr_ready') && 
+        (!session.lastConnection || (now - new Date(session.lastConnection).getTime()) > 30 * 60 * 1000)) {
+      
+      logger.info(`🔍 Validando sesión antigua: ${session.sessionId}`);
       
       try {
         const serviceStatus = await Promise.race([
           whatsappClient.getSessionStatus(session.sessionId),
           new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Timeout')), 8000) // Aumentado de 3 a 8 segundos
+            setTimeout(() => reject(new Error('Validation timeout')), 10000) // 10 segundos
           )
         ]);
         
         if (serviceStatus && serviceStatus.exists) {
-          logger.info(`✅ Sesión ${session.sessionId} confirmada - reutilizando`);
+          logger.info(`✅ Sesión ${session.sessionId} confirmada en servicio - reutilizando`);
           
           // Actualizar estado si es diferente
+          let needsUpdate = false;
           if (session.isConnected !== serviceStatus.isConnected) {
             session.isConnected = serviceStatus.isConnected;
-            session.isListening = serviceStatus.isListening || false;
-            session.status = serviceStatus.isConnected ? 'connected' : session.status;
+            needsUpdate = true;
+          }
+          if (serviceStatus.isConnected && session.status !== 'connected') {
+            session.status = 'connected';
+            session.lastConnection = new Date();
+            needsUpdate = true;
+          }
+          
+          if (needsUpdate) {
             await session.save();
           }
           
@@ -913,53 +928,49 @@ exports.getOrCreateSession = asyncHandler(async (req, res, next) => {
             success: true,
             data: session,
             isExisting: true,
-            message: 'Sesión validada y reutilizada'
+            message: 'Sesión antigua validada y reutilizada'
           });
         } else {
           logger.warn(`❌ Sesión ${session.sessionId} NO existe en servicio`);
-          
-          // Marcar como desconectada PERO continuar buscando
+          // Marcar como desconectada y continuar
           session.status = 'disconnected';
           session.isConnected = false;
           session.isListening = false;
           session.lastDisconnection = new Date();
           await session.save();
-          
-          continue; // Continuar con la siguiente sesión
+          continue;
         }
       } catch (statusError) {
-        logger.warn(`⚠️ Error/timeout al validar sesión ${session.sessionId}: ${statusError.message}`);
+        logger.warn(`⚠️ Error/timeout validando ${session.sessionId}: ${statusError.message}`);
         
-        // ✅ CAMBIO CRÍTICO: En caso de timeout, NO marcar como fallida inmediatamente
-        // Si es una sesión muy reciente, dar beneficio de la duda
-        if (session.lastConnection || session.lastQRTimestamp) {
-          const lastActivity = Math.max(
-            session.lastConnection ? new Date(session.lastConnection).getTime() : 0,
-            session.lastQRTimestamp ? new Date(session.lastQRTimestamp).getTime() : 0
-          );
+        // 🎯 CAMBIO CRÍTICO: Si es timeout pero la sesión es relativamente reciente, dar beneficio de la duda
+        const lastActivity = Math.max(
+          session.lastConnection ? new Date(session.lastConnection).getTime() : 0,
+          session.lastQRTimestamp ? new Date(session.lastQRTimestamp).getTime() : 0,
+          new Date(session.createdAt).getTime()
+        );
+        
+        const timeSinceActivity = now - lastActivity;
+        const oneHour = 60 * 60 * 1000;
+        
+        if (timeSinceActivity < oneHour) {
+          logger.info(`🎲 Timeout en sesión ${session.sessionId} pero es relativamente reciente - dando beneficio de la duda`);
           
-          const timeSinceActivity = Date.now() - lastActivity;
-          const twoMinutes = 2 * 60 * 1000;
+          whatsAppSocketBridge.subscribeToSession(session.sessionId);
           
-          if (timeSinceActivity < twoMinutes) {
-            logger.info(`🎯 Timeout en sesión reciente ${session.sessionId} - asumiendo que está ocupada, reutilizando`);
-            
-            whatsAppSocketBridge.subscribeToSession(session.sessionId);
-            
-            if (session.status === 'qr_ready') {
-              socketService.startQRPolling(session.sessionId);
-            }
-            
-            return res.status(200).json({
-              success: true,
-              data: session,
-              isExisting: true,
-              message: 'Sesión reutilizada (servicio ocupado)'
-            });
+          if (session.status === 'qr_ready') {
+            socketService.startQRPolling(session.sessionId);
           }
+          
+          return res.status(200).json({
+            success: true,
+            data: session,
+            isExisting: true,
+            message: 'Sesión reutilizada (servicio ocupado o desconectado temporalmente)'
+          });
         }
         
-        // Para sesiones más antiguas, marcar como problemática y continuar
+        // Para sesiones muy antiguas, marcar como problemáticas
         session.status = 'disconnected';
         session.isConnected = false;
         await session.save();
@@ -968,8 +979,8 @@ exports.getOrCreateSession = asyncHandler(async (req, res, next) => {
     }
   }
   
-  // 🆕 Solo crear nueva sesión si NO hay sesiones recientes válidas
-  logger.info(`🆕 Creando nueva sesión para usuario ${userId}`);
+  // 🆕 SOLO crear nueva sesión si NO hay ninguna sesión reciente reutilizable
+  logger.info(`🆕 Creando nueva sesión para usuario ${userId} - no hay sesiones recientes válidas`);
   
   const sessionId = `${Date.now()}-${Math.floor(Math.random() * 1000)}`;
   
@@ -1807,147 +1818,99 @@ exports.autoReinitializeSession = asyncHandler(async (req, res, next) => {
 // Endpoint para restaurar sesiones cuando el usuario vuelve a cargar la página
 exports.restoreSessions = asyncHandler(async (req, res, next) => {
   const userId = req.user.id;
-  
-  logger.info(`🔄 Restaurando sesiones para usuario ${userId} (con validación)`);
-  
-  // Buscar sesiones del usuario ordenadas por actividad reciente
+
+  logger.info(`🔄 Restaurando sesiones para usuario ${userId} (solo estado de conexión)`);
+
+  // Solo las 5 más recientes para evitar ciclos largos
   const sessions = await Session.find({ userId })
-    .sort({ lastConnection: -1, lastQRTimestamp: -1, createdAt: -1 })
+    .sort({ lastConnection: -1, createdAt: -1 })
     .limit(5);
-  
+
   if (sessions.length === 0) {
     return res.status(200).json({
       success: true,
       data: {
         activeSessions: [],
         recommendedAction: 'create_new',
-        message: 'No hay sesiones disponibles, crear nueva sesión'
+        recommendedSessionId: null,
+        message: 'No hay sesiones disponibles, crear nueva sesión 1836',
+        timestamp: Date.now()
       }
     });
   }
-  
-  const now = Date.now();
-  const fiveMinutes = 5 * 60 * 1000;
-  const tenMinutes = 10 * 60 * 1000;
-  
-  const validatedSessions = [];
-  
-  // 🔍 Validar cada sesión contra el servicio
+
+  // Buscar la PRIMERA sesión realmente conectada (capaz de monitorear)
+  let connectedSession = null;
+
   for (const session of sessions) {
-    let isValid = false;
-    let validationResult = 'unknown';
-    
     try {
-      // Solo validar sesiones que parecen activas
-      if ((session.isConnected && session.lastConnection) || 
-          (session.status === 'qr_ready' && session.lastQRTimestamp)) {
-        
-        const serviceStatus = await Promise.race([
-          whatsappClient.getSessionStatus(session.sessionId),
-          new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Timeout')), 2000)
-          )
-        ]);
-        
-        if (serviceStatus && serviceStatus.exists) {
-          isValid = true;
-          validationResult = serviceStatus.isConnected ? 'connected' : 'exists';
-          
-          // Actualizar estado en BD si es diferente
-          if (session.isConnected !== serviceStatus.isConnected) {
-            session.isConnected = serviceStatus.isConnected;
-            session.status = serviceStatus.isConnected ? 'connected' : session.status;
-            await session.save();
+      // Consulta real al servicio de WhatsApp (timeout 2s)
+      const serviceStatus = await Promise.race([
+        whatsappClient.getSessionStatus(session.sessionId),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 600000))
+      ]);
+      if (serviceStatus && serviceStatus.isConnected) {
+        // Actualiza el estado en BD si hace falta
+        if (!session.isConnected || session.status !== 'connected') {
+          session.isConnected = true;
+          session.status = 'connected';
+          await session.save();
+        }
+        connectedSession = session;
+        break;
+      }
+    } catch (e) {
+      // Ignora sesiones caídas/timeouts
+      continue;
+    }
+  }
+
+  if (connectedSession) {
+    // Puedes suscribirte aquí si tu flujo lo necesita
+    whatsAppSocketBridge.subscribeToSession(connectedSession.sessionId);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        activeSessions: [
+          {
+            sessionId: connectedSession.sessionId,
+            name: connectedSession.name,
+            status: 'connected',
+            isConnected: true,
+            isListening: connectedSession.isListening,
+            lastConnection: connectedSession.lastConnection,
+            lastQRTimestamp: connectedSession.lastQRTimestamp,
+            createdAt: connectedSession.createdAt,
+            recommendation: 'use_immediately',
+            priority: 10,
+            isValid: true,
+            validationResult: 'connected'
           }
-        } else {
-          validationResult = 'not_found';
-        }
-      } else {
-        validationResult = 'inactive';
+        ],
+        recommendedAction: 'restore_session',
+        recommendedSessionId: connectedSession.sessionId,
+        message: 'Sesión conectada encontrada, puede monitorear',
+        timestamp: Date.now()
       }
-    } catch (error) {
-      validationResult = 'error';
-    }
-    
-    const analysis = {
-      sessionId: session.sessionId,
-      name: session.name,
-      status: session.status,
-      isConnected: session.isConnected,
-      isListening: session.isListening,
-      lastConnection: session.lastConnection,
-      lastQRTimestamp: session.lastQRTimestamp,
-      createdAt: session.createdAt,
-      recommendation: 'unknown',
-      priority: 0,
-      isValid,
-      validationResult
-    };
-    
-    // Solo asignar prioridad a sesiones válidas
-    if (isValid) {
-      if (session.isConnected && session.lastConnection) {
-        const timeSinceConnection = now - new Date(session.lastConnection).getTime();
-        
-        if (timeSinceConnection < fiveMinutes) {
-          analysis.recommendation = 'use_immediately';
-          analysis.priority = 10;
-        } else if (timeSinceConnection < tenMinutes) {
-          analysis.recommendation = 'verify_and_use';
-          analysis.priority = 8;
-        }
-      }
-      
-      if (session.status === 'qr_ready' && session.lastQRTimestamp) {
-        const timeSinceQR = now - new Date(session.lastQRTimestamp).getTime();
-        
-        if (timeSinceQR < fiveMinutes) {
-          analysis.recommendation = 'qr_still_valid';
-          analysis.priority = Math.max(analysis.priority, 9);
-        }
-      }
-    }
-    
-    validatedSessions.push(analysis);
+    });
   }
-  
-  // Ordenar por prioridad
-  validatedSessions.sort((a, b) => b.priority - a.priority);
-  
-  // Determinar acción recomendada
-  const bestSession = validatedSessions.find(s => s.isValid && s.priority > 0);
-  let recommendedAction = 'create_new';
-  let recommendedSessionId = null;
-  let message = 'Crear nueva sesión';
-  
-  if (bestSession) {
-    recommendedAction = bestSession.recommendation === 'use_immediately' ? 'restore_session' : 
-                       bestSession.recommendation === 'qr_still_valid' ? 'show_qr' : 'verify_session';
-    recommendedSessionId = bestSession.sessionId;
-    message = bestSession.recommendation === 'use_immediately' ? 'Sesión activa encontrada' :
-              bestSession.recommendation === 'qr_still_valid' ? 'Código QR válido encontrado' :
-              'Sesión potencialmente activa encontrada';
-              
-    // Suscribir si es necesario
-    if (bestSession.recommendation === 'use_immediately') {
-      whatsAppSocketBridge.subscribeToSession(bestSession.sessionId);
-    } else if (bestSession.recommendation === 'qr_still_valid') {
-      whatsAppSocketBridge.subscribeToSession(bestSession.sessionId);
-      socketService.startQRPolling(bestSession.sessionId);
-    }
-  }
-  
-  res.status(200).json({
+
+  // Si no hay ninguna conectada, recomienda crear nueva
+  return res.status(200).json({
     success: true,
     data: {
-      activeSessions: validatedSessions,
-      recommendedAction,
-      recommendedSessionId,
-      message,
-      timestamp: now
+      activeSessions: [],
+      recommendedAction: 'create_new',
+      recommendedSessionId: null,
+      message: 'No hay sesiones conectadas, crear nueva 1906',
+      timestamp: Date.now()
     }
   });
 });
+
+
+
 
 // Endpoint rápido para verificar si una sesión específica sigue activa
 exports.quickSessionStatus = asyncHandler(async (req, res, next) => {

@@ -17,13 +17,18 @@ class WhatsAppSocketBridge {
     this.pendingSessions = new Set(); // Sesiones pendientes de suscribir
     this.isConnected = false;
     this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 10;
+    this.maxReconnectAttempts = 20; // 🔧 Aumentado de 10 a 20
     this.lastConnectionTime = null;
     this.sessionStatusCache = new Map(); // Cache para evitar actualizaciones duplicadas
+    
+    // 🆕 NUEVAS PROPIEDADES para reconexión más robusta
+    this.reconnectTimeout = null;
+    this.connectionCheckInterval = null;
+    this.forceReconnectAfter = 5 * 60 * 1000; // 5 minutos sin conexión = reconexión forzada
   }
 
   /**
-   * Inicializa la conexión con el servicio de WhatsApp
+   * 🔧 MEJORADO: Inicializa la conexión con el servicio de WhatsApp
    */
   initialize() {
     if (this.whatsappClient && this.isConnected) {
@@ -33,8 +38,15 @@ class WhatsAppSocketBridge {
 
     logger.info(`Conectando al servicio de WhatsApp en ${this.whatsappServiceUrl}`);
     
+    // 🔧 Limpiar timeouts anteriores
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    
     // Limpiar conexión anterior si existe
     if (this.whatsappClient) {
+      this.whatsappClient.removeAllListeners(); // 🔧 Limpiar listeners
       this.whatsappClient.disconnect();
     }
     
@@ -42,18 +54,41 @@ class WhatsAppSocketBridge {
       reconnection: true,
       reconnectionAttempts: this.maxReconnectAttempts,
       reconnectionDelay: 2000,
-      reconnectionDelayMax: 30000,
-      timeout: 10000,
-      forceNew: false,
+      reconnectionDelayMax: 10000, // 🔧 Reducido de 30s a 10s
+      timeout: 15000, // 🔧 Aumentado de 10s a 15s
+      forceNew: true, // 🔧 Forzar nueva conexión
       transports: ['websocket', 'polling']
     });
     
     this.setupEventHandlers();
+    this.startConnectionMonitoring(); // 🆕 Monitoreo activo
     return this.whatsappClient;
   }
 
   /**
-   * Configura todos los manejadores de eventos
+   * 🆕 NUEVO: Monitoreo activo de conexión
+   */
+  startConnectionMonitoring() {
+    // Limpiar monitoreo anterior
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+    }
+    
+    // Verificar conexión cada 30 segundos
+    this.connectionCheckInterval = setInterval(() => {
+      if (!this.isConnected && this.lastConnectionTime) {
+        const timeSinceLastConnection = Date.now() - this.lastConnectionTime;
+        
+        if (timeSinceLastConnection > this.forceReconnectAfter) {
+          logger.warn(`⚠️ Sin conexión por ${Math.round(timeSinceLastConnection/60000)} minutos - forzando reconexión`);
+          this.forceReconnect();
+        }
+      }
+    }, 30000);
+  }
+
+  /**
+   * 🔧 MEJORADO: Configura todos los manejadores de eventos
    */
   setupEventHandlers() {
     // Evento de conexión exitosa
@@ -73,7 +108,7 @@ class WhatsAppSocketBridge {
       this.resubscribeToActiveSessions();
     });
 
-    // Evento de desconexión
+    // 🔧 MEJORADO: Evento de desconexión
     this.whatsappClient.on('disconnect', (reason) => {
       this.isConnected = false;
       
@@ -82,15 +117,19 @@ class WhatsAppSocketBridge {
         socketId: this.whatsappClient?.id
       });
 
-      // NO marcar todas las sesiones como desconectadas automáticamente
-      // Solo notificar la desconexión del puente
+      // 🔧 MEJORA: Solo notificar bridge_disconnected, NO marcar sesiones como desconectadas
       this.activeSessions.forEach(sessionId => {
         socketService.emitToSession(sessionId, 'bridge_disconnected', {
           reason,
           timestamp: Date.now(),
-          message: 'Conexión con servicio WhatsApp perdida'
+          message: 'Conexión con servicio WhatsApp perdida - reintentando...' // 🔧 Mensaje más optimista
         });
       });
+
+      // 🆕 Programar reconexión agresiva para razones específicas
+      if (reason === 'transport close' || reason === 'transport error') {
+        this.scheduleReconnect(5000); // Reconectar en 5 segundos
+      }
     });
 
     // Evento de reconexión exitosa
@@ -115,7 +154,7 @@ class WhatsAppSocketBridge {
       });
     });
 
-    // Evento de error de conexión
+    // 🔧 MEJORADO: Evento de error de conexión
     this.whatsappClient.on('connect_error', (error) => {
       this.isConnected = false;
       this.reconnectAttempts++;
@@ -126,18 +165,31 @@ class WhatsAppSocketBridge {
         maxAttempts: this.maxReconnectAttempts
       });
 
-      // Si excedemos los intentos, esperar más tiempo antes de reiniciar
+      // 🔧 Estrategia de reconexión más agresiva
       if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-        logger.error('Máximo de intentos de reconexión alcanzado, esperando...');
-        setTimeout(() => {
-          this.reconnectAttempts = 0;
-          this.initialize();
-        }, 60000); // Esperar 1 minuto
+        logger.error('Máximo de intentos alcanzado - programando reconexión en 30 segundos');
+        this.scheduleReconnect(30000); // 🔧 Usar método programado
       }
     });
 
     // Configurar manejadores de eventos específicos de WhatsApp
     this.setupWhatsAppEventHandlers();
+  }
+
+  /**
+   * 🆕 NUEVO: Programar reconexión
+   */
+  scheduleReconnect(delay) {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    
+    logger.info(`🔄 Programando reconexión en ${delay/1000} segundos`);
+    
+    this.reconnectTimeout = setTimeout(() => {
+      this.reconnectAttempts = 0; // Reset counter
+      this.initialize();
+    }, delay);
   }
 
   /**
@@ -281,9 +333,9 @@ class WhatsAppSocketBridge {
           updateData.isListening = false;
           updateData.lastDisconnection = new Date();
           
-          // Limpiar suscripción cuando se confirma desconexión
-          this.unsubscribeFromSession(sessionId);
-          logger.info(`Sesión ${sessionId} desconectada, suscripción removida`);
+          // 🔧 MEJORA: NO desuscribir inmediatamente, dar tiempo para reconexión
+          // this.unsubscribeFromSession(sessionId);
+          logger.info(`Sesión ${sessionId} desconectada, manteniendo suscripción para posible reconexión`);
           break;
           
         case 'qr_ready':
@@ -600,28 +652,51 @@ class WhatsAppSocketBridge {
   }
 
   /**
-   * Fuerza reconexión
+   * 🔧 MEJORADO: Fuerza reconexión
    */
   forceReconnect() {
-    logger.info('Forzando reconexión al servicio de WhatsApp');
+    logger.info('🔧 Forzando reconexión al servicio de WhatsApp');
     
+    // 🔧 Limpiar todo
     if (this.whatsappClient) {
+      this.whatsappClient.removeAllListeners(); // 🔧 Limpiar listeners
       this.whatsappClient.disconnect();
+      this.whatsappClient = null;
     }
     
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    
+    this.isConnected = false;
+    this.reconnectAttempts = 0;
+    
+    // Reinicializar después de un breve delay
     setTimeout(() => {
-      this.reconnectAttempts = 0;
       this.initialize();
     }, 2000);
   }
 
   /**
-   * Limpia recursos
+   * 🔧 MEJORADO: Limpia recursos
    */
   cleanup() {
     logger.info('Limpiando recursos del socket bridge');
     
+    // 🔧 Limpiar timeouts e intervalos
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+      this.connectionCheckInterval = null;
+    }
+    
     if (this.whatsappClient) {
+      this.whatsappClient.removeAllListeners(); // 🔧 Limpiar listeners
       this.whatsappClient.disconnect();
       this.whatsappClient = null;
     }
@@ -639,10 +714,23 @@ const whatsAppSocketBridge = new WhatsAppSocketBridge();
 // Inicializar automáticamente
 whatsAppSocketBridge.initialize();
 
-// Health check periódico cada 2 minutos
+// 🔧 MEJORADO: Health check más agresivo cada minuto
 setInterval(() => {
-  whatsAppSocketBridge.healthCheck();
-}, 120000);
+  if (!whatsAppSocketBridge.healthCheck()) {
+    const stats = whatsAppSocketBridge.getConnectionStats();
+    
+    // Si llevamos mucho tiempo desconectados, forzar reconexión
+    if (!stats.isConnected && stats.lastConnectionTime) {
+      const timeSinceConnection = Date.now() - stats.lastConnectionTime;
+      const fiveMinutes = 5 * 60 * 1000;
+      
+      if (timeSinceConnection > fiveMinutes) {
+        logger.warn(`🚨 Forzando reconexión por desconexión prolongada (${Math.round(timeSinceConnection/60000)} min)`);
+        whatsAppSocketBridge.forceReconnect();
+      }
+    }
+  }
+}, 60000); // 🔧 Cada minuto en lugar de cada 2 minutos
 
 // Limpiar cache de estados cada 5 minutos
 setInterval(() => {
@@ -656,11 +744,12 @@ setInterval(() => {
   }
 }, 300000);
 
-// Limpiar suscripciones obsoletas cada 10 minutos
+// 🔧 MEJORADO: Limpiar suscripciones obsoletas cada 10 minutos - más tolerante
 setInterval(async () => {
   try {
     const activeSessions = await Session.find({
-      status: { $in: ['connected', 'qr_ready'] }
+      status: { $in: ['connected', 'qr_ready'] },
+      deletedAt: { $exists: false } // 🔧 Solo sesiones no eliminadas
     }).select('sessionId');
     
     const activeSessionIds = new Set(activeSessions.map(s => s.sessionId));

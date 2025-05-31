@@ -110,7 +110,7 @@ class WhatsAppClient {
       const response = await axios.get(`${this.baseURL}/api/session/${sessionId}/status`, {
         timeout: this.timeout
       });
-
+      
       return response.data;
     } catch (error) {
       logger.debug(`Error al obtener estado de sesión ${sessionId}:`, {
