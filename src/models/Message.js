@@ -37,7 +37,7 @@ const messageSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['chat', 'image', 'video', 'audio', 'ptt', 'document', 'location', 'contact', 'sticker', 'unknown'],
+    enum: ['chat', 'text', 'image', 'video', 'audio', 'ptt', 'document', 'location', 'contact', 'sticker', 'unknown'],
     default: 'chat'
   },
   hasMedia: {
@@ -45,11 +45,17 @@ const messageSchema = new mongoose.Schema({
     default: false
   },
   media: {
+    type: String, // Para compatibilidad con el campo anterior
     url: String,
     mimetype: String,
     filename: String,
     filesize: Number,
-    caption: String
+    caption: String,
+    // 🆕 NUEVOS CAMPOS para metadata extendida
+    duration: Number,
+    width: Number,
+    height: Number,
+    isViewOnce: Boolean
   },
   isGroupMessage: {
     type: Boolean,
@@ -79,7 +85,11 @@ const messageSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
-  // Contenido específico según el tipo de mensaje
+  // 🆕 NUEVO CAMPO para tipo de dispositivo
+  deviceType: {
+    type: String
+  },
+  // Contenido específico según el tipo de mensaje (SIN CAMBIOS)
   location: {
     latitude: Number,
     longitude: Number,
@@ -88,21 +98,29 @@ const messageSchema = new mongoose.Schema({
   vcard: {
     type: String
   },
-  // Metadatos adicionales
+  // 🔧 METADATOS EXTENDIDOS para incluir info del microservicio
   metadata: {
-    type: mongoose.Schema.Types.Mixed
+    type: mongoose.Schema.Types.Mixed,
+    // Estructura sugerida para nuevos metadatos:
+    // serviceVersion: String,
+    // capturedAt: Number,
+    // processedAt: Number,
+    // receivedAt: Number,
+    // deviceType: String,
+    // chatInfo: Object
   }
 }, {
   timestamps: true
 });
 
-// Índices compuestos para mejorar las consultas
+// Índices existentes
 messageSchema.index({ sessionId: 1, timestamp: -1 });
 messageSchema.index({ sessionId: 1, chatId: 1, timestamp: -1 });
 messageSchema.index({ sessionId: 1, type: 1 });
 messageSchema.index({ sessionId: 1, isGroupMessage: 1 });
+messageSchema.index({ sessionId: 1, deviceType: 1 });
 
-// Función para eliminar mensajes antiguos (útil para gestionar el tamaño de la BD)
+// Función para eliminar mensajes antiguos
 messageSchema.statics.deleteOldMessages = async function(sessionId, daysToKeep = 30) {
   const date = new Date();
   date.setDate(date.getDate() - daysToKeep);

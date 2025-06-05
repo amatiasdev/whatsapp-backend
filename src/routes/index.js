@@ -5,6 +5,8 @@ const router = express.Router();
 const sessionRoutes = require('./sessionRoutes');
 const messageRoutes = require('./messageRoutes');
 const userRoutes = require('./userRoutes');
+const whatsappRoutes = require('./whatsappRoutes');
+const simpleSummaryRoutes = require('./summaryHistoryRoutes');
 
 // Middleware de versión de API
 router.use((req, res, next) => {
@@ -16,6 +18,8 @@ router.use((req, res, next) => {
 router.use('/sessions', sessionRoutes);
 router.use('/messages', messageRoutes);
 router.use('/users', userRoutes);
+router.use('/whatsapp', whatsappRoutes);
+router.use('/summaries', simpleSummaryRoutes);
 
 // Ruta de salud/estado
 router.get('/health', (req, res) => {

@@ -450,6 +450,96 @@ exports.deleteOldMessages = async (req, res) => {
   }
 };
 
+exports.sendMessagesToN8n  = async (sessionId) => {
+  try {
+    logger.info(`Enviando mensajes agrupados de la sesión ${sessionId} a n8n`);
+    
+    // Obtener mensajes de la sesión agrupados por chatId
+    const messagesByChat = await Message.aggregate([
+      { 
+        $match: { 
+          sessionId: sessionId,
+        } 
+      },
+      {
+        $group: {
+          _id: "$chatId",
+          messages: {
+            $push: {
+              body: "$body",
+              timestamp: "$timestamp",
+              contactName: "$contactName",
+              phoneNumber: { $substr: ["$from", 0, { $subtract: [{ $strLenCP: "$from" }, 5] }] }, // Remover @c.us
+              hasMedia: "$hasMedia",
+              mediaUrl: "$media.url",
+              mediaType: "$type"
+            }
+          },
+          totalMessages: { $sum: 1 },
+          lastMessage: { $max: "$timestamp" }
+        }
+      },
+      { $sort: { lastMessage: -1 } }
+    ]);
+
+    if (messagesByChat.length === 0) {
+      logger.info(`No hay mensajes para enviar de la sesión ${sessionId}`);
+      return { success: true, message: 'No hay mensajes para enviar' };
+    }
+
+    // Preparar payload para n8n
+    const payload = {
+      sessionId: sessionId,
+      timestamp: Date.now(),
+      totalChats: messagesByChat.length,
+      chats: messagesByChat.map(chat => ({
+        chatId: chat._id,
+        contactInfo: {
+          name: chat.messages[0]?.contactName || 'Desconocido',
+          phoneNumber: chat.messages[0]?.phoneNumber || chat._id.replace('@c.us', '')
+        },
+        messageCount: chat.totalMessages,
+        messages: chat.messages.map(msg => ({
+          body: msg.body,
+          timestamp: msg.timestamp,
+          hasMedia: msg.hasMedia,
+          mediaUrl: msg.mediaUrl || null,
+          mediaType: msg.hasMedia ? msg.mediaType : null
+        })).sort((a, b) => a.timestamp - b.timestamp) // Ordenar cronológicamente
+      }))
+    };
+
+    // Enviar a n8n
+    const response = await axios.post('https://n8n.aldomatias.com/webhook/whatsapp-message', payload, {
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+
+    logger.info(`Mensajes enviados a n8n exitosamente`, {
+      sessionId,
+      totalChats: messagesByChat.length,
+      responseStatus: response.status
+    });
+
+    return { 
+      success: true, 
+      totalChats: messagesByChat.length,
+      responseStatus: response.status 
+    };
+    
+  } catch (error) {
+    logger.error(`Error al enviar mensajes a n8n:`, {
+      sessionId,
+      errorMessage: error.message,
+      status: error.response?.status
+    });
+    
+    throw error;
+  }
+};
+
 // ACTUALIZAR EL MODULE.EXPORTS (IMPORTANTE)
 module.exports = {
   processIncomingMessages: exports.processIncomingMessages,
@@ -459,5 +549,6 @@ module.exports = {
   getWhatsAppChatsBasic: exports.getWhatsAppChatsBasic, // NUEVO: chats básicos
   sendTextMessage: exports.sendTextMessage,
   sendMediaMessage: exports.sendMediaMessage,
-  deleteOldMessages: exports.deleteOldMessages
+  deleteOldMessages: exports.deleteOldMessages,
+  sendMessagesToN8n: exports.sendMessagesToN8n
 };

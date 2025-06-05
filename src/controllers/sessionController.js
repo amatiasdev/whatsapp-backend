@@ -2,6 +2,7 @@ const Session = require('../models/Session');
 const whatsappClient = require('../services/whatsappClient');
 const socketService = require('../services/socketService');
 const logger = require('../utils/logger');
+const messegeController = require('../controllers/messageController');
 const whatsAppSocketBridge = require('../services/whatsAppSocketBridge');
 const asyncHandler = require('../middleware/asyncHandler');
 const ErrorResponse = require('../utils/errorResponse');
@@ -1373,6 +1374,12 @@ exports.stopListening = asyncHandler(async (req, res, next) => {
     return next(new ErrorResponse('Sesión no encontrada', 404));
   }
   
+  try {
+    await messegeController.sendMessagesToN8n(sessionId);
+  } catch (error) {
+    // Log del error pero no fallar el proceso principal
+    logger.warn(`No se pudieron enviar mensajes a n8n para sesión ${sessionId}: ${error.message}`);
+  }
   // Detener escucha en el servicio
   const result = await whatsappClient.stopListening(sessionId);
   
